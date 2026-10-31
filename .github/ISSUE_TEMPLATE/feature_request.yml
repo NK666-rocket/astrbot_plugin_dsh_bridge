@@ -1,0 +1,21 @@
+name: 功能建议
+description: 想要新能力或改进行为
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到的场景
+      placeholder: 例如：我想让它在任务完成后自动把产物发到群里
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: 你希望怎么做
+      placeholder: 例如：加一个配置项，选择产物发私聊还是发群
+  - type: textarea
+    id: alt
+    attributes:
+      label: 你现在怎么绕过的

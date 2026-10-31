@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安装与常见问题
+    url: https://github.com/NK666-rocket/astrbot_plugin_dsh_bridge/blob/main/INSTALL.md
+    about: 先看安装指南，能解决大部分"没反应/找不到 CLI"的问题

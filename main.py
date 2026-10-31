@@ -226,6 +226,11 @@ class DshBridgePlugin(Star):
     def _api_key(self) -> str:
         return self._str("api_key") or load_api_key_from_astrbot(DATA_DIR)
 
+    def _workspace(self) -> Path:
+        """工作区目录；未配置时跟随用户目录，跨平台安全。"""
+        raw = self._str("scratch_dir")
+        return Path(raw) if raw else (Path.home() / "dsh-bot-workspace")
+
     def _prefix(self) -> str:
         return (self._str("prefix", "dsh") or "dsh").lower()
 
@@ -262,7 +267,7 @@ class DshBridgePlugin(Star):
                 errors.append(name + ": 超过 " + str(max_mb) + "MB")
                 continue
             if inbox is None:
-                inbox = Path(self._str("scratch_dir", "D:/dsh-bot-workspace")) / "inbox" / time.strftime("%Y%m%d-%H%M%S")
+                inbox = self._workspace() / "inbox" / time.strftime("%Y%m%d-%H%M%S")
                 inbox.mkdir(parents=True, exist_ok=True)
             dst = inbox / Path(name).name
             try:
@@ -503,7 +508,7 @@ class DshBridgePlugin(Star):
                 task,
                 cli_path=self._str("dsh_cli_path"),
                 profile=profile,
-                cwd=self._str("scratch_dir", "D:/dsh-bot-workspace") or "D:/dsh-bot-workspace",
+                cwd=str(self._workspace()),
                 timeout=self._int("timeout_sec", 600),
                 api_key=self._api_key(),
                 max_file_mb=self._int("file_max_mb", 50),

@@ -30,19 +30,18 @@
 
 ## 安装
 
-### 方式一：插件市场（推荐）
+**一行地址（插件市场 → 从 URL 安装）：**
 
-1. AstrBot 后台 → 插件市场 → 从 URL 安装
-2. 粘贴本仓库的 Release zip 地址，或仓库地址
-3. 启用插件
+```
+https://github.com/NK666-rocket/astrbot_plugin_dsh_bridge/releases/download/v1.0.0/astrbot_plugin_dsh_bridge-v1.0.0.zip
+```
 
-### 方式二：上传 zip
+其他方式：
 
-下载 `astrbot_plugin_dsh_bridge-vX.Y.Z.zip`，在插件市场里选「上传安装」。
+- **上传 zip**：下载上面的 zip，在插件市场选「上传安装」
+- **手动**：把本目录放到 `AstrBot/core/data/plugins/astrbot_plugin_dsh_bridge/`，重启 AstrBot
 
-### 方式三：手动
-
-把本目录放到 `AstrBot/core/data/plugins/astrbot_plugin_dsh_bridge/`，重启 AstrBot。
+详细步骤（含前置检查、常见卡点）见 [INSTALL.md](INSTALL.md)。
 
 ## 三步配置
 

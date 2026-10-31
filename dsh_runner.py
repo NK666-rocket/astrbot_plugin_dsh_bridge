@@ -13,13 +13,56 @@ from pathlib import Path
 IS_WIN = os.name == "nt"
 CREATE_NO_WINDOW = 0x08000000 if IS_WIN else 0
 
-CLI_CANDIDATES = [
-    r"E:\APP\Deepseek\resources\runtime\cli\bin\dsh.cmd",
-    os.path.expandvars(
-        r"%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd"
-    ),
-    r"C:\Program Files\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd",
-]
+def _cli_candidates() -> list[str]:
+    """按平台给出常见的 DSH 安装位置（不写死任何个人路径）。"""
+    out: list[str] = []
+    if os.name == "nt":
+        local = os.environ.get("LOCALAPPDATA") or ""
+        pf = os.environ.get("ProgramFiles") or ""
+        pf86 = os.environ.get("ProgramFiles(x86)") or ""
+        for base in (local + "/Programs", pf, pf86):
+            if base.strip():
+                out.append(str(Path(base) / "DeepSeek Harness/resources/runtime/cli/bin/dsh.cmd"))
+    return out
+
+
+def _registry_candidates() -> list[str]:
+    """从 Windows 卸载表里找 DSH 安装目录（安装器一般会登记）。"""
+    out: list[str] = []
+    if os.name != "nt":
+        return out
+    try:
+        import winreg
+    except Exception:
+        return out
+    roots = (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE)
+    bases = (
+        r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+        r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+    )
+    for root in roots:
+        for base in bases:
+            try:
+                with winreg.OpenKey(root, base) as key:
+                    count = winreg.QueryInfoKey(key)[0]
+                    for i in range(count):
+                        try:
+                            name = winreg.EnumKey(key, i)
+                            with winreg.OpenKey(key, name) as sub:
+                                display = str(winreg.QueryValueEx(sub, "DisplayName")[0])
+                                if "DeepSeek" not in display and "Harness" not in display:
+                                    continue
+                                loc = str(winreg.QueryValueEx(sub, "InstallLocation")[0])
+                                if loc:
+                                    out.append(str(Path(loc) / "resources/runtime/cli/bin/dsh.cmd"))
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+    return out
+
+
+CLI_CANDIDATES = _cli_candidates() + _registry_candidates()
 
 BRIEF_RE = re.compile(r"<简报>(.*?)</简报>", re.S)
 ARTIFACT_RE = re.compile(r"^\s*产物\s*[:：]\s*(.*)$", re.M)
@@ -150,7 +193,7 @@ def run_task(
     *,
     cli_path: str = "",
     profile: str = "bot",
-    cwd: str = r"D:\dsh-bot-workspace",
+    cwd: str = "",
     timeout: int = 600,
     api_key: str = "",
     extra_env: dict | None = None,
@@ -171,7 +214,7 @@ def run_task(
     if not cli:
         return {"ok": False, "error": "找不到 dsh CLI，请配置 dsh_cli_path", "duration": 0}
 
-    workdir = Path(cwd)
+    workdir = Path(cwd) if cwd else (Path.home() / "dsh-bot-workspace")
     workdir.mkdir(parents=True, exist_ok=True)
 
     env = os.environ.copy()

@@ -1,0 +1,64 @@
+name: Bug 报告
+description: 装好之后出了问题时用这个模板
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！填得越全，定位越快。
+  - type: input
+    id: astrbot-version
+    attributes:
+      label: AstrBot 版本
+      description: 后台「关于」里能看到，或看启动日志
+      placeholder: "例如 4.29.3"
+    validations:
+      required: true
+  - type: input
+    id: dsh-version
+    attributes:
+      label: DSH 版本
+      description: 命令行执行 `dsh --version` 的结果
+      placeholder: "例如 0.2.1-rc.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows 10/11
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 你做了什么 / 期望什么 / 实际什么
+      placeholder: |
+        1. 在 QQ 发 /dsh 建 hello.txt
+        2. 期望收到 ✅ 完成
+        3. 实际回了 ❌ 执行失败：找不到 dsh CLI
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: /dsh doctor 的输出
+      description: 在 QQ 里发 `/dsh doctor`，把结果贴上来
+      render: text
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: AstrBot 日志里 `[dsh-bridge]` 开头的行，或插件设置页的报错
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 自查
+      options:
+        - label: 我已经确认 QQ 号在白名单里
+        - label: 我已经跑过 /dsh doctor
