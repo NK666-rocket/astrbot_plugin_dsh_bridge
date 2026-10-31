@@ -28,7 +28,7 @@ dsh --version
 2. 粘贴：
 
 ```
-https://github.com/NK666-rocket/astrbot_plugin_dsh_bridge/releases/download/v1.0.0/astrbot_plugin_dsh_bridge-v1.0.0.zip
+https://github.com/NK666-rocket/astrbot_plugin_dsh_bridge/releases/latest/download/astrbot_plugin_dsh_bridge.zip
 ```
 
 3. 等安装完成 → 启用

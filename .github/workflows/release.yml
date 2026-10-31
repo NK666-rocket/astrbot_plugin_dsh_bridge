@@ -27,11 +27,11 @@ jobs:
             --exclude '*.pyc' \
             ./ "/tmp/pkg/${name}/"
           cd /tmp/pkg
-          zip -r "${name}-${tag}.zip" "${name}"
-          ls -l "${name}-${tag}.zip"
+          zip -r "${name}.zip" "${name}"
+          ls -l "${name}.zip"
 
       - name: Publish release asset
         uses: softprops/action-gh-release@v2
         with:
-          files: /tmp/pkg/astrbot_plugin_dsh_bridge-${{ github.ref_name }}.zip
+          files: /tmp/pkg/astrbot_plugin_dsh_bridge.zip
           generate_release_notes: true
