@@ -140,11 +140,7 @@ def validate_profile(cli: str, name: str, level: str) -> tuple[bool, str]:
 def ensure_profiles(cfg: dict, cli: str, home: Path | None = None) -> list[tuple[bool, str]]:
     """确保三档 profile 存在且可用，返回逐条结果。"""
     home = Path(home or DEFAULT_HOME)
-    mapping = {
-        "ws": cfg.get("profile_ws") or "bot",
-        "ro": cfg.get("profile_ro") or "bot-ro",
-        "full": cfg.get("profile_full") or "bot-full",
-    }
+    mapping = {"ws": "bot", "ro": "bot-ro", "full": "bot-full"}
     results: list[tuple[bool, str]] = []
     for level, name in mapping.items():
         ok, msg = make_profile(home, name, level)
@@ -180,19 +176,12 @@ def doctor(cfg: dict, cli: str, home: Path | None = None, api_key_available: boo
     except Exception as exc:  # noqa: BLE001
         checks.append(("工作区可写", False, f"{ws}：{exc}"))
 
-    if cfg.get("api_key"):
-        checks.append(("API Key", True, "插件配置里已填"))
-    elif api_key_available:
+    if api_key_available:
         checks.append(("API Key", True, "未填，已从 AstrBot 的 DeepSeek provider 读到"))
     else:
         checks.append(("API Key", False, "未填，且 AstrBot 里也没找到 DeepSeek 密钥"))
 
-    mapping = {
-        "ws": cfg.get("profile_ws") or "bot",
-        "ro": cfg.get("profile_ro") or "bot-ro",
-        "full": cfg.get("profile_full") or "bot-full",
-    }
-    for level, name in mapping.items():
+    for name in ("bot", "bot-ro", "bot-full"):
         exists = (home / "profiles" / name).exists()
         checks.append((f"profile {name}", exists, "已存在" if exists else "缺失（可用 /dsh init 生成）"))
     return checks

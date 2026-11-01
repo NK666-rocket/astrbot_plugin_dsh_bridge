@@ -1,6 +1,6 @@
 """把 QQ 消息桥接到本机 DeepSeek Harness（dsh headless）。
 
-S5：会话复用（含 TTL）、权限三档切换、附件接收、私聊/群聊白名单。
+v2 配置模型：UMO 白名单、管理员名单、私聊/群聊分区、群聊两种上下文、一次性提权。
 """
 
 from __future__ import annotations
@@ -15,29 +15,38 @@ from pathlib import Path
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-try:
-    from astrbot.api.message_components import File, Image, Plain
-except Exception:  # 旧版 AstrBot 没有 File 组件
-    from astrbot.api.message_components import Image, Plain  # type: ignore
-
-    File = None  # type: ignore
+from astrbot.api.message_components import File, Image, Plain
 from astrbot.api.star import Context, Star
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.star.filter.event_message_type import EventMessageType
 
 from .bootstrap import doctor as run_doctor, ensure_profiles
-from .config_model import normalize
-from .dsh_runner import load_api_key_from_astrbot, run_task
+from .config_model import LEVELS, normalize, parse_umo
+from .dsh_runner import load_api_key_from_astrbot, load_platform_id, run_task
 
 NL = chr(10)
 PLUGIN_DIR = Path(__file__).resolve().parent
 DATA_DIR = PLUGIN_DIR.parents[1]  # .../core/data
 STATE_FILE = PLUGIN_DIR / "state.json"
 
-RESERVED = {"send", "cancel", "status", "help", "reset", "perm", "doctor", "init"}
-LEVELS = ["ro", "ws", "full"]
+RESERVED = {"send", "cancel", "status", "help", "reset", "perm", "doctor", "init", "set"}
 LEVEL_NAMES = {"ro": "只读", "ws": "工作区写", "full": "完全访问"}
+
+SETTABLE = {
+    "private_whitelist": "list",
+    "group_shared_context": "list",
+    "group_isolated_context": "list",
+    "admin_list": "list",
+    "private_default_permission": "perm",
+    "group_default_permission": "perm",
+    "private_attach_max_mb": "int",
+    "private_file_max_mb": "int",
+    "private_file_max_count": "int",
+    "group_attach_max_mb": "int",
+    "group_file_max_mb": "int",
+    "group_file_max_count": "int",
+}
 
 HELP_TEXT = (
     "【/dsh 用法】" + NL
@@ -47,11 +56,18 @@ HELP_TEXT = (
     + "4) /dsh cancel      取消这次的片段收集" + NL
     + "5) /dsh status      看当前状态" + NL
     + "6) /dsh perm        看/切换权限：perm ro|ws|full" + NL
-    + "7) /dsh reset       清空和 DSH 的对话记忆（下次开新会话）" + NL
-    + "8) /dsh doctor      环境自检（CLI / 凭据 / profile / 工作区）" + NL
-    + "9) /dsh init        自动创建缺失的 DSH profile" + NL
-    + "10) /dsh help      看这份说明" + NL
+    + "7) /dsh doctor      环境自检" + NL
+    + "8) /dsh reset       清空本会话的 DSH 记忆" + NL
+    + "9) /dsh help        看这份说明" + NL
     + "小提示：收集过程中 {idle} 分钟没有新片段，会自动{action}"
+)
+
+ADMIN_HELP = (
+    "👑 管理员命令" + NL
+    + "/dsh init                      创建缺失的 DSH profile" + NL
+    + "/dsh perm full confirm         私聊：切到完全访问；群聊：一次性提权（仅下一条）" + NL
+    + "/dsh set <键> <值> confirm     修改白名单 / 默认权限 / 文件上限" + NL
+    + "可改键：" + "、".join(sorted(SETTABLE))
 )
 
 
@@ -68,19 +84,15 @@ class DshBridgePlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.conf = config
-        self.cfg = normalize(config)
-        if not self.cfg["scratch_dir"]:
-            self.cfg["scratch_dir"] = str(Path.home() / "dsh-bot-workspace")
         self._lock = asyncio.Lock()
         self._buffers: dict[str, Buffer] = {}
-        logger.info(
-            "[dsh-bridge] 配置加载：白名单=" + str(self.cfg["allowed_uins"])
-            + " 群聊=" + str(self.cfg["allow_group"])
-            + " 权限=" + self.cfg["default_permission"] + "/" + self.cfg["max_permission"]
-            + " 工作区=" + self.cfg["scratch_dir"]
-        )
-        self._state: dict = {"sessions": {}, "perms": {}}
+        self._state: dict = {"sessions": {}, "perms": {}, "oneshot": {}, "overrides": {}}
         self._load_state()
+        self.platform_id = load_platform_id(DATA_DIR)
+        self.cfg = normalize(config, self.platform_id, self._state.get("overrides") or {})
+        if not self.cfg["scratch_dir"]:
+            self.cfg["scratch_dir"] = str(Path.home() / "dsh-bot-workspace")
+        self._log_config()
         self._task = asyncio.create_task(self._idle_loop())
         self._boot = asyncio.create_task(self._bootstrap())
 
@@ -88,59 +100,41 @@ class DshBridgePlugin(Star):
         self._task.cancel()
         self._boot.cancel()
 
-    # ---------- 配置（已由 config_model 归一化） ----------
-    def _str(self, key: str, default: str = "") -> str:
-        v = self.cfg.get(key, default)
-        return str(v).strip() if v is not None else default
+    # ---------- 配置 ----------
+    def _reload_cfg(self):
+        self.cfg = normalize(self.conf, self.platform_id, self._state.get("overrides") or {})
+        if not self.cfg["scratch_dir"]:
+            self.cfg["scratch_dir"] = str(Path.home() / "dsh-bot-workspace")
 
-    def _int(self, key: str, default: int) -> int:
-        try:
-            return int(self.cfg.get(key, default))
-        except Exception:
-            return default
+    def _log_config(self):
+        c = self.cfg
+        logger.info(
+            "[dsh-bridge] 配置加载：私聊白名单=" + str(len(c["private_whitelist"]))
+            + " 群(共用/独立)=" + str(len(c["group_shared_context"])) + "/" + str(len(c["group_isolated_context"]))
+            + " 管理员=" + str(len(c["admin_list"]))
+            + " 私聊权限=" + c["private_default_permission"]
+            + " 群权限=" + c["group_default_permission"]
+            + " 工作区=" + c["scratch_dir"]
+        )
+        for w in c.get("_warnings", []):
+            logger.warning("[dsh-bridge] " + w)
 
-    def _num(self, key: str, default: float) -> float:
-        try:
-            return float(self.cfg.get(key, default))
-        except Exception:
-            return default
+    def _workspace(self) -> Path:
+        raw = self.cfg.get("scratch_dir") or ""
+        return Path(raw) if raw else (Path.home() / "dsh-bot-workspace")
 
-    def _list(self, key: str) -> list[str]:
-        v = self.cfg.get(key, [])
-        return list(v) if isinstance(v, (list, tuple)) else []
+    def _prefix(self) -> str:
+        return (str(self.cfg.get("prefix") or "dsh")).lower()
 
-    def _bool(self, key: str, default: bool) -> bool:
-        v = self.cfg.get(key, default)
-        return bool(v)
-
-    async def _bootstrap(self):
-        """加载后自检 DSH 环境：缺 profile 就建，结果写日志。"""
-        try:
-            from .dsh_runner import find_cli
-            cli = find_cli(self._str("dsh_cli_path"))
-            if not cli:
-                logger.warning("[dsh-bridge] 未找到 dsh CLI，桥功能不可用；请检查插件配置")
-                return
-            results = await asyncio.to_thread(ensure_profiles, self.cfg, cli)
-            for ok, msg in results:
-                (logger.info if ok else logger.warning)("[dsh-bridge] " + msg)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(f"[dsh-bridge] 自举异常：{exc}")
-
-    def _format_checks(self, checks: list[tuple[str, bool, str]]) -> str:
-        lines = []
-        for name, ok, detail in checks:
-            lines.append(("✅ " if ok else "❌ ") + name + "：" + detail)
-        return NL.join(lines)
-
-    # ---------- 状态持久化 ----------
+    # ---------- 状态 ----------
     def _load_state(self):
         try:
             if STATE_FILE.exists():
                 data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
                 if isinstance(data, dict):
-                    self._state["sessions"] = data.get("sessions", {}) or {}
-                    self._state["perms"] = data.get("perms", {}) or {}
+                    for k in ("sessions", "perms", "oneshot", "overrides"):
+                        if isinstance(data.get(k), dict):
+                            self._state[k] = data[k]
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[dsh-bridge] 状态读取失败：{exc}")
 
@@ -152,106 +146,108 @@ class DshBridgePlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[dsh-bridge] 状态写入失败：{exc}")
 
-    # ---------- 会话 / 权限键 ----------
-    def _scope_key(self, event: AstrMessageEvent) -> str:
-        scope = (self._str("session_scope", "per_chat") or "per_chat").lower()
-        platform = str(event.get_platform_id())
-        group = str(event.get_group_id() or "")
-        chat = group or str(event.get_sender_id())
-        if scope == "global":
-            return "global"
-        if scope == "per_user":
-            return f"{platform}|{chat}|{event.get_sender_id()}"
-        return f"{platform}|{chat}"
+    # ---------- 身份与会话键 ----------
+    def _is_group(self, event: AstrMessageEvent) -> bool:
+        return bool(event.get_group_id())
 
-    def _get_session(self, key: str) -> tuple[str, int]:
-        rec = (self._state["sessions"] or {}).get(key) or {}
-        sid = str(rec.get("session_id") or "")
-        turns = int(rec.get("turns") or 0)
-        updated = float(rec.get("updated") or 0)
-        ttl = self._num("session_ttl_hours", 24)
-        if not sid:
-            return "", 0
-        if ttl > 0 and time.time() - updated > ttl * 3600:
-            self._state["sessions"].pop(key, None)
-            self._save_state()
-            return "", 0
-        return sid, turns
+    def _umo(self, event: AstrMessageEvent) -> str:
+        return str(event.unified_msg_origin or "")
 
-    def _set_session(self, key: str, sid: str, turns: int):
-        if not sid:
-            return
-        self._state["sessions"][key] = {"session_id": sid, "turns": turns, "updated": time.time()}
-        self._save_state()
+    def _sender_umo(self, event: AstrMessageEvent) -> str:
+        return f"{self.platform_id or event.get_platform_id()}:FriendMessage:{event.get_sender_id()}"
 
-    def _perm_index(self, level: str) -> int:
-        try:
-            return LEVELS.index(level)
-        except ValueError:
-            return 1
+    def _is_admin(self, event: AstrMessageEvent) -> bool:
+        admins = self.cfg.get("admin_list") or []
+        return self._sender_umo(event) in admins or self._umo(event) in admins
 
-    def _perm_for(self, key: str) -> str:
-        cur = str((self._state["perms"] or {}).get(key) or self._str("default_permission", "ws"))
-        if cur not in LEVELS:
-            cur = "ws"
-        cap = self._str("max_permission", "ws")
-        if self._perm_index(cur) > self._perm_index(cap):
-            cur = cap if cap in LEVELS else "ws"
-        return cur
-
-    def _set_perm(self, key: str, level: str):
-        self._state["perms"][key] = level
-        self._save_state()
-
-    def _profile_for(self, level: str) -> str:
-        default_profile = self._str("profile_ws", "bot") or "bot"
-        if level == "ro":
-            return self._str("profile_ro", "bot-ro") or default_profile
-        if level == "full":
-            return self._str("profile_full", "bot-full") or default_profile
-        return default_profile
-
-    # ---------- 鉴权 ----------
     def _allowed(self, event: AstrMessageEvent) -> bool:
-        sender = str(event.get_sender_id())
-        group = str(event.get_group_id() or "")
-        if group:
-            if not self._bool("allow_group", False):
+        umo = self._umo(event)
+        if self._is_group(event):
+            if not self.cfg["allow_group"]:
                 return False
-            return group in self._list("allowed_groups") and sender in self._list("allowed_uins")
-        if not self._bool("allow_private", True):
+            return umo in (self.cfg["group_shared_context"] or []) or umo in (
+                self.cfg["group_isolated_context"] or []
+            )
+        if not self.cfg["allow_private"]:
             return False
-        return sender in self._list("allowed_uins")
+        return umo in (self.cfg["private_whitelist"] or [])
 
-    def _api_key(self) -> str:
-        return self._str("api_key") or load_api_key_from_astrbot(DATA_DIR)
+    def _group_shared(self, umo: str) -> bool:
+        return umo in (self.cfg["group_shared_context"] or [])
 
-    def _workspace(self) -> Path:
-        """工作区目录；未配置时跟随用户目录，跨平台安全。"""
-        raw = self._str("scratch_dir")
-        return Path(raw) if raw else (Path.home() / "dsh-bot-workspace")
+    def _session_key(self, event: AstrMessageEvent, perm: str) -> str:
+        umo = self._umo(event)
+        if self._is_group(event) and not self._group_shared(umo):
+            return f"{umo}|{event.get_sender_id()}|{perm}"
+        return f"{umo}|{perm}"
 
-    def _prefix(self) -> str:
-        return (self._str("prefix", "dsh") or "dsh").lower()
+    def _perm_cap(self, event: AstrMessageEvent) -> str:
+        if self._is_group(event):
+            return "ws"
+        return "full" if self._is_admin(event) else "ws"
 
-    def _key(self, event: AstrMessageEvent) -> str:
-        kind = "group" if event.get_group_id() else "private"
-        chat = str(event.get_group_id() or event.get_sender_id())
-        return f"{event.get_platform_id()}|{kind}|{chat}|{event.get_sender_id()}"
+    def _perm_default(self, event: AstrMessageEvent) -> str:
+        if self._is_group(event):
+            return self.cfg["group_default_permission"]
+        return self.cfg["private_default_permission"]
+
+    def _perm_explicit(self, event: AstrMessageEvent, perm: str) -> str:
+        cap = self._perm_cap(event)
+        try:
+            if LEVELS.index(perm) > LEVELS.index(cap):
+                return cap
+        except ValueError:
+            return self._perm_default(event)
+        return perm
+
+    def _perm_base(self, event: AstrMessageEvent) -> str:
+        key = self._session_key(event, "x")
+        return key.rsplit("|", 1)[0]
+
+    def _current_perm(self, event: AstrMessageEvent) -> str:
+        stored = (self._state["perms"] or {}).get(self._perm_base(event)) or self._perm_default(event)
+        if stored not in LEVELS:
+            stored = self._perm_default(event)
+        return self._perm_explicit(event, stored)
+
+    def _set_perm(self, event: AstrMessageEvent, level: str):
+        self._state["perms"][self._perm_base(event)] = level
+        self._save_state()
+
+    # ---------- 一次性提权 ----------
+    def _oneshot_get(self, event: AstrMessageEvent) -> dict | None:
+        rec = (self._state["oneshot"] or {}).get(self._umo(event))
+        if not rec:
+            return None
+        if float(rec.get("expires") or 0) < time.time():
+            self._state["oneshot"].pop(self._umo(event), None)
+            self._save_state()
+            return None
+        return rec
+
+    def _oneshot_set(self, event: AstrMessageEvent):
+        self._state["oneshot"][self._umo(event)] = {
+            "umo": self._sender_umo(event),
+            "expires": time.time() + 600,
+        }
+        self._save_state()
+
+    def _oneshot_clear(self, umo: str):
+        if (self._state["oneshot"] or {}).pop(umo, None) is not None:
+            self._save_state()
 
     # ---------- 附件 ----------
     async def _ingest_attachments(self, event: AstrMessageEvent) -> tuple[list[str], list[str]]:
-        """把消息里的文件/图片下载到 scratch_dir/inbox/<时间戳>/，返回 (路径, 错误)。"""
         paths: list[str] = []
         errors: list[str] = []
-        max_mb = self._int("attach_max_mb", 50)
+        max_mb = self.cfg["group_attach_max_mb"] if self._is_group(event) else self.cfg["private_attach_max_mb"]
         try:
             segs = event.get_messages()
         except Exception:
             return paths, errors
         inbox = None
         for seg in segs:
-            kinds = (Image,) if File is None else (File, Image)
+            kinds = (File, Image) if File is not None else (Image,)
             if not isinstance(seg, kinds):
                 continue
             name = (getattr(seg, "name", "") or "attachment").strip()
@@ -264,7 +260,7 @@ class DshBridgePlugin(Star):
                 errors.append(name + ": 下载失败")
                 continue
             if os.path.getsize(local) > max_mb * 1024 * 1024:
-                errors.append(name + ": 超过 " + str(max_mb) + "MB")
+                errors.append(name + f": 超过 {max_mb}MB")
                 continue
             if inbox is None:
                 inbox = self._workspace() / "inbox" / time.strftime("%Y%m%d-%H%M%S")
@@ -278,9 +274,8 @@ class DshBridgePlugin(Star):
             paths.append(str(dst))
         return paths, errors
 
-    # ---------- 文本解析 ----------
+    # ---------- 解析 ----------
     def _scan_sub(self, raw: str) -> tuple[str | None, str]:
-        """扫描整条消息（可含多行）里的 /dsh send|cancel|status|help|reset|perm。"""
         p = self._prefix()
         sub: str | None = None
         kept: list[str] = []
@@ -298,9 +293,9 @@ class DshBridgePlugin(Star):
                     word = s[len(p):].strip().split(" ")[0].lower()
                     if word in RESERVED:
                         sub = word
-                        trailing = s[len(p):].strip()[len(word):].strip()
-                        if trailing:
-                            kept.append(trailing)
+                        rest = s[len(p):].strip()[len(word):].strip()
+                        if rest:
+                            kept.append(rest)
                         continue
             kept.append(line)
         return sub, NL.join(kept).strip()
@@ -318,12 +313,11 @@ class DshBridgePlugin(Star):
     # ---------- 静默收集 ----------
     @filter.event_message_type(EventMessageType.ALL, priority=10)
     async def collect_listener(self, event: AstrMessageEvent):
-        """收集期间的普通消息：并入缓冲并静默，不触发其它处理器。"""
-        if not self.conf.get("enabled", True):
+        if not self.cfg["enabled"]:
             return
         if not self._allowed(event):
             return
-        buf = self._buffers.get(self._key(event))
+        buf = self._buffers.get(self._umo(event))
         if not buf:
             return
         raw = (event.message_str or "").strip()
@@ -331,8 +325,7 @@ class DshBridgePlugin(Star):
             return
         p = self._prefix()
         low = raw.lstrip("/").lower()
-        head = raw.lstrip("/")[len(p): len(p) + 1]
-        if low == p or (low.startswith(p) and head in (" ", "\t", "\n", "，", ",", "：", ":")):
+        if low == p or (low.startswith(p) and raw.lstrip("/")[len(p): len(p) + 1] in (" ", "\t", "\n", "，", ",", "：", ":")):
             return
         if raw.startswith("/"):
             return
@@ -344,70 +337,60 @@ class DshBridgePlugin(Star):
     # ---------- 命令 ----------
     @filter.command("dsh")
     async def dsh(self, event: AstrMessageEvent):
-        """把任务交给本机 DSH；多段内容用 /dsh send 提交。"""
-        if not self.conf.get("enabled", True):
+        if not self.cfg["enabled"]:
             return
         if not self._allowed(event):
-            logger.info(f"[dsh-bridge] 非白名单会话，忽略：{event.unified_msg_origin}")
+            logger.info(f"[dsh-bridge] 非白名单会话，忽略：{self._umo(event)}")
             return
 
         att_paths, att_errs = await self._ingest_attachments(event)
         sub, body = self._scan_sub(event.message_str or "")
-        key = self._key(event)
-        skey = self._scope_key(event)
+        umo = self._umo(event)
+        is_admin = self._is_admin(event)
 
         if sub == "help":
-            yield event.plain_result(self._help_text())
+            text = self._help_text()
+            if is_admin:
+                text += NL + NL + ADMIN_HELP
+            yield event.plain_result(text)
             return
 
         if sub == "status":
-            buf = self._buffers.get(key)
-            perm = self._perm_for(skey)
-            sid, turns = self._get_session(skey + "#" + perm)
-            sess = "续接第 " + str(turns) + " 轮" if sid and turns else "新会话"
-            if buf:
-                yield event.plain_result(
-                    "📝 正在收集：" + str(buf.parts) + " 段，" + str(len(buf.text)) + " 字"
-                    + ("，附件 " + str(len(buf.attachments)) + " 个" if buf.attachments else "")
-                    + NL + "权限：" + LEVEL_NAMES.get(perm, perm) + " ｜ 会话：" + sess
-                )
-            else:
-                yield event.plain_result(
-                    "💤 没有收集中的任务 ｜ 权限：" + LEVEL_NAMES.get(perm, perm) + " ｜ 会话：" + sess
-                )
+            yield event.plain_result(self._status_text(event))
+            return
+
+        if sub == "doctor":
+            from .dsh_runner import find_cli
+            cli = find_cli(self.cfg.get("dsh_cli_path") or "")
+            checks = await asyncio.to_thread(run_doctor, self.cfg, cli, None, bool(self._api_key()))
+            head = "🩺 环境自检" + NL
+            if self.cfg.get("_conflicts"):
+                head += "⚠️ 群上下文冲突：" + "、".join(self.cfg["_conflicts"]) + NL
+            yield event.plain_result(head + self._format_checks(checks))
             return
 
         if sub == "cancel":
-            if self._buffers.pop(key, None):
+            if self._buffers.pop(umo, None):
                 yield event.plain_result("🗑 已取消")
             else:
                 yield event.plain_result("没有正在收集的任务")
             return
 
-        if sub == "reset":
-            for k in list(self._state["sessions"].keys()):
-                if k == skey or k.startswith(skey + "#"):
-                    self._state["sessions"].pop(k, None)
-            self._save_state()
-            yield event.plain_result("🔄 会话已重置，下次任务开新会话")
-            return
-
-        if sub == "perm":
-            yield event.plain_result(self._handle_perm(event, skey, body))
-            return
-
-        if sub == "doctor":
+        if sub in ("reset", "init"):
+            if not is_admin:
+                yield event.plain_result("❌ 仅管理员可使用该命令")
+                return
+            if sub == "reset":
+                for k in list(self._state["sessions"].keys()):
+                    if k.startswith(umo + "|"):
+                        self._state["sessions"].pop(k, None)
+                self._save_state()
+                yield event.plain_result("🔄 会话已重置，下次任务开新会话")
+                return
             from .dsh_runner import find_cli
-            cli = find_cli(self._str("dsh_cli_path"))
-            checks = await asyncio.to_thread(run_doctor, self.cfg, cli, None, bool(self._api_key()))
-            yield event.plain_result("🩺 环境自检" + NL + self._format_checks(checks))
-            return
-
-        if sub == "init":
-            from .dsh_runner import find_cli
-            cli = find_cli(self._str("dsh_cli_path"))
+            cli = find_cli(self.cfg.get("dsh_cli_path") or "")
             if not cli:
-                yield event.plain_result("❌ 找不到 dsh CLI，请先在插件配置里填 dsh_cli_path")
+                yield event.plain_result("❌ 找不到 dsh CLI，请先在插件配置里填 DSH CLI 路径")
                 return
             results = await asyncio.to_thread(ensure_profiles, self.cfg, cli)
             ok_all = all(ok for ok, _ in results)
@@ -416,8 +399,16 @@ class DshBridgePlugin(Star):
             )
             return
 
+        if sub == "perm":
+            yield event.plain_result(self._handle_perm(event, body))
+            return
+
+        if sub == "set":
+            yield event.plain_result(self._handle_set(event, body))
+            return
+
         if sub == "send":
-            buf = self._buffers.pop(key, None)
+            buf = self._buffers.pop(umo, None)
             if not buf or (not buf.text.strip() and not buf.attachments):
                 yield event.plain_result("没有可提交的内容，先用 /dsh 内容 开始")
                 return
@@ -426,7 +417,7 @@ class DshBridgePlugin(Star):
                 task += NL + NL + "附件（本机路径，请直接读取）：" + NL + NL.join(buf.attachments)
         else:
             text = self._strip_prefix(body)
-            buf = self._buffers.get(key)
+            buf = self._buffers.get(umo)
             if buf:
                 if text:
                     buf.text = (buf.text + NL + text).strip()
@@ -446,10 +437,10 @@ class DshBridgePlugin(Star):
             if not text and not att_paths:
                 yield event.plain_result(self._help_text())
                 return
-            b = Buffer(umo=event.unified_msg_origin, text=text, parts=1, updated=time.time())
+            b = Buffer(umo=umo, text=text, parts=1, updated=time.time())
             b.attachments.extend(att_paths)
-            self._buffers[key] = b
-            minutes = self._int("idle_minutes", 3)
+            self._buffers[umo] = b
+            minutes = self.cfg["idle_minutes"]
             tail = ("（" + str(minutes) + " 分钟无新片段会自动提交）") if minutes > 0 else ""
             extra = ("，含 " + str(len(att_paths)) + " 个附件") if att_paths else ""
             yield event.plain_result(
@@ -457,9 +448,8 @@ class DshBridgePlugin(Star):
             )
             return
 
-        max_chars = self._int("max_msg_chars", 4000)
-        if len(task) > max_chars:
-            yield event.plain_result(f"任务太长（{len(task)} 字），上限 {max_chars} 字。")
+        if len(task) > self.cfg["max_msg_chars"]:
+            yield event.plain_result(f"任务太长（{len(task)} 字），上限 {self.cfg['max_msg_chars']} 字。")
             return
         if self._lock.locked():
             yield event.plain_result("⏳ 前面还有任务在跑，请稍后再发。")
@@ -469,106 +459,260 @@ class DshBridgePlugin(Star):
             yield event.plain_result("⚠️ 附件问题：" + "；".join(att_errs[:3]))
         yield event.plain_result("⏳ 收到，开始执行")
 
-        result = await self._run(task, skey)
-        await self._deliver(event.unified_msg_origin, result)
+        result = await self._run(task, event)
+        await self._deliver(umo, result)
 
     # ---------- 权限命令 ----------
-    def _handle_perm(self, event: AstrMessageEvent, skey: str, body: str) -> str:
+    def _handle_perm(self, event: AstrMessageEvent, body: str) -> str:
         tokens = [t.lower() for t in (body or "").split()]
-        cur = self._perm_for(skey)
+        is_group = self._is_group(event)
+        is_admin = self._is_admin(event)
+        cur = self._current_perm(event)
+
         if not tokens:
-            return ("当前权限：" + LEVEL_NAMES.get(cur, cur) + NL
-                    + "可选：/dsh perm ro（只读）｜ ws（工作区写）｜ full（完全访问，需私聊 + confirm）")
+            extra = ""
+            rec = self._oneshot_get(event)
+            if rec:
+                extra = NL + "⚡ 一次性完全访问剩余 " + str(int(rec["expires"] - time.time())) + " 秒"
+            lines = ["当前权限：" + LEVEL_NAMES.get(cur, cur)]
+            if is_group:
+                lines.append("群聊持久上限：工作区写")
+            lines.append(
+                "可选：/dsh perm ro ｜ /dsh perm ws"
+                + ("｜ /dsh perm full confirm" if is_admin else "")
+            )
+            return NL.join(lines) + extra
+
         level = tokens[0]
         if level not in LEVELS:
             return "未知权限：" + level + "，可选 ro / ws / full"
-        if not self._bool("allow_permission_switch", True):
-            return "权限切换已被配置关闭"
-        cap = self._str("max_permission", "ws")
-        if self._perm_index(level) > self._perm_index(cap):
-            return ("超出权限上限（当前上限：" + LEVEL_NAMES.get(cap, cap) + "），"
-                    "需要在插件配置里把 max_permission 调高")
-        if level == "full" and event.get_group_id():
-            return "完全访问只能在私聊里切换"
+
+        if is_group and not self.cfg["allow_switch_group"]:
+            return "群聊权限切换已被管理员关闭"
+        if not is_group and not self.cfg["allow_switch_private"]:
+            return "私聊权限切换已被管理员关闭"
+
+        if is_group and not is_admin:
+            return "❌ 仅管理员可在群里切换权限"
+        if not is_admin and level == "full":
+            return "❌ 完全访问是管理员专属"
+
         if level == "full" and "confirm" not in tokens:
-            return "⚠️ 切到完全访问等于放开整台电脑，请再发一次：/dsh perm full confirm"
-        self._set_perm(skey, level)
-        return "✅ 权限已切换为：" + LEVEL_NAMES.get(level, level)
+            return "⚠️ 完全访问等于放开整台电脑，请再发一次：/dsh perm full confirm"
+
+        if is_group and level == "full":
+            self._oneshot_set(event)
+            return "⚡ 已授予一次性完全访问：仅对下一条你发起的任务生效"
+
+        self._set_perm(event, level)
+        return "✅ 权限已切换为：" + LEVEL_NAMES[level]
+
+    # ---------- 管理员改配置 ----------
+    def _handle_set(self, event: AstrMessageEvent, body: str) -> str:
+        if not self._is_admin(event):
+            return "❌ 仅管理员可修改配置"
+        parts = (body or "").split()
+        if len(parts) < 3 or parts[-1].lower() != "confirm":
+            return (
+                "用法：/dsh set <键> <值> confirm" + NL
+                + "可改键：" + "、".join(sorted(SETTABLE)) + NL
+                + "示例：/dsh set private_whitelist 肥嘟嘟:FriendMessage:2809688590 confirm" + NL
+                + "列表用逗号分隔；恢复后台值用 /dsh set <键> reset confirm"
+            )
+        key = parts[0]
+        if key not in SETTABLE:
+            return "❌ 不可修改的键：" + key + NL + "可改：" + "、".join(sorted(SETTABLE))
+        value = " ".join(parts[1:-1]).strip()
+        kind = SETTABLE[key]
+
+        overrides = self._state.setdefault("overrides", {})
+        if value.lower() == "reset":
+            overrides.pop(key, None)
+            self._save_state()
+            self._reload_cfg()
+            return "↩️ 已恢复该项为后台配置值"
+
+        if kind == "perm":
+            v = value.lower()
+            if v not in LEVELS:
+                return "❌ 权限值应为 ro / ws / full"
+            overrides[key] = v
+        elif kind == "int":
+            try:
+                overrides[key] = int(value)
+            except Exception:
+                return "❌ 需要整数"
+        else:
+            items = [x.strip() for x in value.replace("，", ",").split(",") if x.strip()]
+            bad = [x for x in items if not parse_umo(x)]
+            if bad:
+                return "❌ 这些不是合法 UMO：" + "、".join(bad) + NL + "示例：肥嘟嘟:FriendMessage:2809688590"
+            overrides[key] = items
+
+        self._save_state()
+        self._reload_cfg()
+        return "✅ 已更新 " + key + "（运行期覆盖，后台配置不变；用 reset 可恢复）"
 
     # ---------- 执行 ----------
-    async def _run(self, task: str, skey: str) -> dict:
-        perm = self._perm_for(skey)
-        profile = self._profile_for(perm)
-        sess_key = skey + "#" + perm
+    def _api_key(self) -> str:
+        return load_api_key_from_astrbot(DATA_DIR)
+
+    async def _run(self, task: str, event: AstrMessageEvent) -> dict:
+        is_group = self._is_group(event)
+        perm = self._current_perm(event)
+        oneshot = self._oneshot_get(event)
+        used_oneshot = False
+        if oneshot and oneshot.get("umo") == self._sender_umo(event):
+            perm = "full"
+            used_oneshot = True
+
+        profile = {"ro": "bot-ro", "ws": "bot", "full": "bot-full"}[perm]
+        file_mb = self.cfg["group_file_max_mb"] if is_group else self.cfg["private_file_max_mb"]
+        file_count = self.cfg["group_file_max_count"] if is_group else self.cfg["private_file_max_count"]
+
+        skey = self._session_key(event, perm)
         sid, turns = "", 0
-        if (self._str("session_mode", "reuse") or "reuse").lower() == "reuse":
-            sid, turns = self._get_session(sess_key)
+        if float(self.cfg["session_ttl_hours"]) > 0:
+            sid, turns = self._get_session(skey)
+
         def invoke(session_id: str) -> dict:
             return run_task(
                 task,
-                cli_path=self._str("dsh_cli_path"),
+                cli_path=self.cfg.get("dsh_cli_path") or "",
                 profile=profile,
                 cwd=str(self._workspace()),
-                timeout=self._int("timeout_sec", 600),
+                timeout=self.cfg["timeout_sec"],
                 api_key=self._api_key(),
-                max_file_mb=self._int("file_max_mb", 50),
-                max_file_count=self._int("file_max_count", 5),
-                save_full_over=max(self._int("brief_chars", 400), 1) * 2,
+                max_file_mb=file_mb,
+                max_file_count=file_count,
+                save_full_over=max(self.cfg["brief_chars"], 1) * 2,
                 session_id=session_id,
             )
 
         async with self._lock:
             result = await asyncio.to_thread(invoke, sid)
             if (not result.get("ok")) and sid:
-                # 会话可能已失效或属于别的 profile：退化为新会话重试一次
                 retry = await asyncio.to_thread(invoke, "")
                 if retry.get("ok"):
                     result = retry
                     sid, turns = "", 0
+        if used_oneshot:
+            self._oneshot_clear(self._umo(event))
+
         if result.get("ok"):
             new_sid = result.get("session_id") or sid
-            self._set_session(sess_key, new_sid, turns + 1)
+            self._set_session(skey, new_sid, turns + 1)
             result["session_note"] = ("续接第 " + str(turns + 1) + " 轮") if sid else "新会话"
         else:
             result["session_note"] = ""
-        result["perm"] = LEVEL_NAMES.get(perm, perm)
+        result["perm"] = LEVEL_NAMES.get(perm, perm) + ("（一次性）" if used_oneshot else "")
         return result
 
-    # ---------- 空闲自动动作 ----------
+    def _get_session(self, key: str) -> tuple[str, int]:
+        rec = (self._state["sessions"] or {}).get(key) or {}
+        sid = str(rec.get("session_id") or "")
+        turns = int(rec.get("turns") or 0)
+        updated = float(rec.get("updated") or 0)
+        ttl = float(self.cfg["session_ttl_hours"]) * 3600
+        if not sid:
+            return "", 0
+        if ttl > 0 and time.time() - updated > ttl:
+            self._state["sessions"].pop(key, None)
+            self._save_state()
+            return "", 0
+        return sid, turns
+
+    def _set_session(self, key: str, sid: str, turns: int):
+        if not sid:
+            return
+        self._state["sessions"][key] = {"session_id": sid, "turns": turns, "updated": time.time()}
+        self._save_state()
+
+    # ---------- 自举 ----------
+    async def _bootstrap(self):
+        try:
+            from .dsh_runner import find_cli
+            cli = find_cli(self.cfg.get("dsh_cli_path") or "")
+            if not cli:
+                logger.warning("[dsh-bridge] 未找到 dsh CLI，桥功能不可用；请在插件配置里填 DSH CLI 路径")
+                return
+            results = await asyncio.to_thread(ensure_profiles, self.cfg, cli)
+            for ok, msg in results:
+                (logger.info if ok else logger.warning)("[dsh-bridge] " + msg)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"[dsh-bridge] 自举异常：{exc}")
+
+    # ---------- 空闲 ----------
     async def _idle_loop(self):
         while True:
             try:
                 await asyncio.sleep(20)
-                minutes = self._int("idle_minutes", 3)
+                minutes = int(self.cfg["idle_minutes"])
                 if minutes <= 0:
                     continue
                 now = time.time()
-                for key, buf in list(self._buffers.items()):
+                for umo, buf in list(self._buffers.items()):
                     if now - buf.updated < minutes * 60:
                         continue
-                    action = (self._str("idle_action", "submit") or "submit").lower()
-                    self._buffers.pop(key, None)
+                    action = self.cfg["idle_action"]
+                    self._buffers.pop(umo, None)
                     if action == "discard":
-                        await self._send(buf.umo, "⏰ 收集超时，已丢弃")
+                        await self._send(umo, "⏰ 收集超时，已丢弃")
                         continue
                     if self._lock.locked():
-                        await self._send(buf.umo, "⏰ 收集超时，但前面还有任务在跑，已取消本次提交")
+                        await self._send(umo, "⏰ 收集超时，但前面还有任务在跑，已取消本次提交")
                         continue
-                    await self._send(buf.umo, "⏰ 收集超时，自动提交执行")
-                    asyncio.create_task(self._auto_run(buf.umo, key, buf))
+                    await self._send(umo, "⏰ 收集超时，自动提交执行")
+                    asyncio.create_task(self._auto_run(umo, buf))
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[dsh-bridge] 空闲任务异常：{exc}")
 
-    async def _auto_run(self, umo: str, key: str, buf: Buffer):
+    async def _auto_run(self, umo: str, buf: Buffer):
         task = buf.text
         if buf.attachments:
             task += NL + NL + "附件（本机路径，请直接读取）：" + NL + NL.join(buf.attachments)
-        parts = key.split("|")
-        skey = "|".join(parts[:2]) if len(parts) >= 2 else key
-        result = await self._run(task, skey)
+        perm = self.cfg["private_default_permission"]
+        profile = {"ro": "bot-ro", "ws": "bot", "full": "bot-full"}[perm]
+        result = await asyncio.to_thread(
+            run_task,
+            task,
+            cli_path=self.cfg.get("dsh_cli_path") or "",
+            profile=profile,
+            cwd=str(self._workspace()),
+            timeout=self.cfg["timeout_sec"],
+            api_key=self._api_key(),
+            max_file_mb=self.cfg["private_file_max_mb"],
+            max_file_count=self.cfg["private_file_max_count"],
+            save_full_over=max(self.cfg["brief_chars"], 1) * 2,
+        )
         await self._deliver(umo, result)
+
+    # ---------- 输出 ----------
+    def _status_text(self, event: AstrMessageEvent) -> str:
+        is_group = self._is_group(event)
+        umo = self._umo(event)
+        ctx = "共用" if (is_group and self._group_shared(umo)) else ("独立" if is_group else "—")
+        buf = self._buffers.get(umo)
+        lines = [
+            "🪪 会话：" + umo,
+            "身份：" + ("管理员" if self._is_admin(event) else "白名单用户"),
+            "权限：" + LEVEL_NAMES.get(self._current_perm(event), "?"),
+        ]
+        if is_group:
+            lines.append("群上下文：" + ctx + "（" + ("所有发言者共用" if ctx == "共用" else "每人独立") + "）")
+        rec = self._oneshot_get(event)
+        if rec:
+            lines.append("⚡ 一次性完全访问：剩余 " + str(int(rec["expires"] - time.time())) + " 秒")
+        if buf:
+            lines.append("📝 收集中：" + str(buf.parts) + " 段，" + str(len(buf.text)) + " 字")
+        else:
+            lines.append("💤 没有收集中的任务")
+        return NL.join(lines)
+
+    def _format_checks(self, checks: list[tuple[str, bool, str]]) -> str:
+        return NL.join(("✅ " if ok else "❌ ") + name + "：" + detail for name, ok, detail in checks)
 
     async def _send(self, umo: str, text: str):
         try:
@@ -576,12 +720,11 @@ class DshBridgePlugin(Star):
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"[dsh-bridge] 主动发送失败：{exc}")
 
-    # ---------- 输出 ----------
     def _format(self, result: dict) -> str:
         if not result.get("ok"):
             return f"❌ 执行失败：{str(result.get('error') or '未知错误')[:300]}"
         brief = result.get("brief") or "（DSH 没有返回内容）"
-        limit = self._int("brief_chars", 400)
+        limit = self.cfg["brief_chars"]
         if len(brief) > limit:
             brief = brief[:limit].rstrip() + "…（已截断）"
         full = result.get("full_path") or ""
@@ -594,7 +737,7 @@ class DshBridgePlugin(Star):
         files = result.get("files") or []
         if files:
             meta += " · " + str(len(files)) + " 个文件"
-        if self._bool("session_notice", True) and result.get("session_note"):
+        if self.cfg["session_notice"] and result.get("session_note"):
             meta += " · " + str(result["session_note"])
         if result.get("perm"):
             meta += " · " + str(result["perm"])
@@ -617,24 +760,25 @@ class DshBridgePlugin(Star):
         return out or [text]
 
     async def _deliver(self, umo: str, result: dict):
+        files_all = result.get("files") or []
+        if files_all:
+            logger.info("[dsh-bridge] 回传文件：" + str(len(files_all)) + " 个 → " + umo)
         for i, chunk in enumerate(self._chunks(self._format(result))):
             if i:
                 await asyncio.sleep(0.6)
             await self._send(umo, chunk)
-        for path in (result.get("files") or [])[: self._int("file_max_count", 5)]:
+        count = self.cfg["group_file_max_count"] if "GroupMessage" in umo else self.cfg["private_file_max_count"]
+        for path in (result.get("files") or [])[:count]:
             if File is None:
                 await self._send(umo, "📎 文件（当前 AstrBot 不支持直接发文件）：" + path)
                 continue
             try:
                 await asyncio.sleep(0.4)
-                await self.context.send_message(
-                    umo, MessageChain([File(name=Path(path).name, file=path)])
-                )
+                await self.context.send_message(umo, MessageChain([File(name=Path(path).name, file=path)]))
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"[dsh-bridge] 文件发送失败 {path}: {exc}")
                 await self._send(umo, "⚠️ 文件发送失败：" + Path(path).name)
 
     def _help_text(self) -> str:
-        minutes = self._int("idle_minutes", 3)
-        action = "提交" if (self._str("idle_action", "submit") or "submit") == "submit" else "丢弃"
-        return HELP_TEXT.format(idle=minutes, action=action)
+        action = "提交" if self.cfg["idle_action"] == "submit" else "丢弃"
+        return HELP_TEXT.format(idle=self.cfg["idle_minutes"], action=action)

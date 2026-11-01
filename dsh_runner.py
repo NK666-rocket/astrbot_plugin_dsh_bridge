@@ -66,7 +66,7 @@ CLI_CANDIDATES = _cli_candidates() + _registry_candidates()
 
 BRIEF_RE = re.compile(r"<简报>(.*?)</简报>", re.S)
 ARTIFACT_RE = re.compile(r"^\s*产物\s*[:：]\s*(.*)$", re.M)
-WIN_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|*?\n]+")
+WIN_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|*?`\n]+")
 
 
 def find_cli(configured: str = "") -> str:
@@ -125,6 +125,24 @@ def load_api_key_from_astrbot(data_dir: str | Path) -> str:
     return ""
 
 
+def load_platform_id(data_dir: str | Path) -> str:
+    """从 AstrBot 配置里取第一个 aiocqhttp 平台的 id（用于拼 UMO）。"""
+    cfg = Path(data_dir) / "cmd_config.json"
+    if not cfg.exists():
+        return ""
+    try:
+        data = json.loads(cfg.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return ""
+    for p in data.get("platform", []) or []:
+        if p.get("type") == "aiocqhttp":
+            return str(p.get("id") or "")
+    platforms = data.get("platform") or []
+    if platforms:
+        return str(platforms[0].get("id") or "")
+    return ""
+
+
 def extract_brief(text: str, limit: int = 0) -> str:
     """优先取 <简报> 块，其次取正文；limit>0 时裁剪。"""
     text = (text or "").strip()
@@ -143,7 +161,7 @@ def _is_inside(path: Path, root: Path) -> bool:
         return False
 
 
-def collect_files(text: str, root: Path, max_mb: int = 50, max_count: int = 5) -> list[str]:
+def collect_files(text: str, root: Path, max_mb: int = 50, max_count: int = 5, since_ts: float = 0.0) -> list[str]:
     """从回复的『产物：』段里提取工作区内的文件绝对路径。"""
     root = Path(root)
     candidates: list[str] = []
@@ -171,6 +189,25 @@ def collect_files(text: str, root: Path, max_mb: int = 50, max_count: int = 5) -
             out.append(s)
         if len(out) >= max_count:
             break
+
+    # 兜底：模型没写路径时，用任务时间段内新增/修改的文件
+    if not out and since_ts > 0:
+        try:
+            for f in root.rglob("*"):
+                if len(out) >= max_count:
+                    break
+                if not f.is_file():
+                    continue
+                rel = str(f.relative_to(root)).replace("\\", "/")
+                if rel.startswith(".dsh-bridge/") or rel.startswith("inbox/"):
+                    continue
+                if f.stat().st_mtime < since_ts - 2:
+                    continue
+                if f.stat().st_size > max_mb * 1024 * 1024:
+                    continue
+                out.append(str(f.resolve()))
+        except Exception:
+            pass
     return out
 
 
@@ -304,7 +341,7 @@ def run_task(
         "session_id": session_id,
         "usage": usage,
         "duration": duration,
-        "files": collect_files(final_text, workdir, max_file_mb, max_file_count) if ok else [],
+        "files": collect_files(final_text, workdir, max_file_mb, max_file_count, started) if ok else [],
         "full_path": full_path,
     }
     if not ok:

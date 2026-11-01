@@ -2,7 +2,7 @@ name: astrbot_plugin_dsh_bridge
 display_name: DSH 桥接
 desc: 把 QQ 消息桥接到本机 DeepSeek Harness：手机发任务，DSH 执行，简报与产物回 QQ
 help: 装好后在插件设置里填「允许的 QQ 号」和「工作区目录」，然后在 QQ 里发 /dsh 内容 再 /dsh send；发送 /dsh help 查看全部用法
-version: 1.0.1
+version: 2.0.0
 author: NK666-rocket
 repo: https://github.com/NK666-rocket/astrbot_plugin_dsh_bridge
 astrbot_version: ">=4.29.0"
